@@ -268,6 +268,134 @@ fn compute_degrees_r(docs: &[Doc], num_terms: usize) -> Vec<i32> {
     compute_degrees(right, num_terms)    
 }
 
+// Cache-miss threshold, set at compile time via CACHE_MISS_T env var.
+// Represents the number of docid positions that fit in a cache-friendly window.
+const CACHE_MISS_T: usize = {
+    // Parse at compile time; default to 64 if not set.
+    match std::option_env!("CACHE_MISS_T") {
+        Some(s) => {
+            // const-compatible integer parse
+            let bytes = s.as_bytes();
+            let mut result: usize = 0;
+            let mut i = 0;
+            while i < bytes.len() {
+                result = result * 10 + (bytes[i] - b'0') as usize;
+                i += 1;
+            }
+            result
+        }
+        None => 64,
+    }
+};
+
+// Computes the probability that two uniformly-random positions in a partition
+// of size n have distance >= t. Returns 0 when n <= t (all pairs are cache-hits).
+#[inline]
+fn miss_prob(n: usize, t: usize) -> f32 {
+    if n <= t || n <= 1 {
+        return 0.0;
+    }
+    let tf = t as f32;
+    let nf = n as f32;
+    1.0 - (tf - 1.0) * (2.0 * nf - tf) / (nf * (nf - 1.0))
+}
+
+// Cache-miss move gain for one term when moving a document from partition "from"
+// to partition "to". Positive gain = cost decreases = good move.
+//
+// gain_q(from->to) = (f_from - 1) * p_from - f_to * p_to
+//
+// where p_from = miss_prob(n_from, t), p_to = miss_prob(n_to, t).
+// p_from and p_to are passed pre-computed (constant for all terms at a level).
+#[inline]
+fn cache_miss_gain(f_from: i32, p_from: f32, f_to: i32, p_to: f32) -> f32 {
+    (f_from - 1) as f32 * p_from - f_to as f32 * p_to
+}
+
+// Compute move gains using the cache-miss cost function
+// L->R direction, PARALLEL VERSION
+fn compute_move_gains_cache_miss_l2r(
+    from: &mut [Doc],
+    p_from: f32,
+    p_to: f32,
+    fdeg: &[i32],
+    tdeg: &[i32],
+) {
+    from.par_iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f32;
+        for term in &doc.terms {
+            let from_deg = fdeg[*term as usize];
+            let to_deg = tdeg[*term as usize];
+            doc_gain += cache_miss_gain(from_deg, p_from, to_deg, p_to);
+        }
+        doc.gain = doc_gain;
+        doc.leaf_id = 0;
+    });
+}
+
+// Compute move gains using the cache-miss cost function
+// R->L direction, PARALLEL VERSION
+fn compute_move_gains_cache_miss_r2l(
+    from: &mut [Doc],
+    p_from: f32,
+    p_to: f32,
+    fdeg: &[i32],
+    tdeg: &[i32],
+) {
+    from.par_iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f32;
+        for term in &doc.terms {
+            let from_deg = fdeg[*term as usize];
+            let to_deg = tdeg[*term as usize];
+            doc_gain -= cache_miss_gain(from_deg, p_from, to_deg, p_to);
+        }
+        doc.gain = doc_gain;
+        doc.leaf_id = 0;
+    });
+}
+
+// Compute move gains using the cache-miss cost function
+// L->R direction, SEQUENTIAL VERSION
+fn compute_move_gains_cache_miss_l2r_seq(
+    from: &mut [Doc],
+    p_from: f32,
+    p_to: f32,
+    fdeg: &[i32],
+    tdeg: &[i32],
+) {
+    from.iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f32;
+        for term in &doc.terms {
+            let from_deg = fdeg[*term as usize];
+            let to_deg = tdeg[*term as usize];
+            doc_gain += cache_miss_gain(from_deg, p_from, to_deg, p_to);
+        }
+        doc.gain = doc_gain;
+        doc.leaf_id = 0;
+    });
+}
+
+// Compute move gains using the cache-miss cost function
+// R->L direction, SEQUENTIAL VERSION
+fn compute_move_gains_cache_miss_r2l_seq(
+    from: &mut [Doc],
+    p_from: f32,
+    p_to: f32,
+    fdeg: &[i32],
+    tdeg: &[i32],
+) {
+    from.iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f32;
+        for term in &doc.terms {
+            let from_deg = fdeg[*term as usize];
+            let to_deg = tdeg[*term as usize];
+            doc_gain -= cache_miss_gain(from_deg, p_from, to_deg, p_to);
+        }
+        doc.gain = doc_gain;
+        doc.leaf_id = 0;
+    });
+}
+
 // This is the original cost function: Asymmetric
 fn expb(log_from: f32, log_to: f32, deg1: i32, deg2: i32) -> f32 {
     let d1f = deg1 as f32;
@@ -570,6 +698,20 @@ fn compute_gains(mut left: &mut [Doc], mut right: &mut [Doc], ldeg: &[i32], rdeg
             });
         }
 
+        // (3) -- Cache-miss cost function
+        "cache_miss" => {
+            let p_left = miss_prob(left.len(), CACHE_MISS_T);
+            let p_right = miss_prob(right.len(), CACHE_MISS_T);
+            rayon::scope(|s| {
+                s.spawn(|_| {
+                    compute_move_gains_cache_miss_l2r(&mut left, p_left, p_right, &ldeg, &rdeg);
+                });
+                s.spawn(|_| {
+                    compute_move_gains_cache_miss_r2l(&mut right, p_right, p_left, &rdeg, &ldeg);
+                });
+            });
+        }
+
         // Should be unreachable...
         _ => {
             log::info!("Error: Couldn't match the gain function.");
@@ -606,6 +748,14 @@ fn compute_gains_seq(mut left: &mut [Doc], mut right: &mut [Doc], ldeg: &[i32], 
         "approx_2" => {
             compute_move_gains_a2_seq(&mut left, log2_left, log2_right, &ldeg, &rdeg);
             compute_move_gains_a2_seq(&mut right, log2_right, log2_left, &ldeg, &rdeg);
+        }
+
+        // (3) -- Cache-miss cost function
+        "cache_miss" => {
+            let p_left = miss_prob(left.len(), CACHE_MISS_T);
+            let p_right = miss_prob(right.len(), CACHE_MISS_T);
+            compute_move_gains_cache_miss_l2r_seq(&mut left, p_left, p_right, &ldeg, &rdeg);
+            compute_move_gains_cache_miss_r2l_seq(&mut right, p_right, p_left, &rdeg, &ldeg);
         }
 
         // Should be unreachable...

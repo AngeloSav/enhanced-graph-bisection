@@ -13,6 +13,7 @@ pub struct Doc {
     pub terms: Vec<u32>,
     pub freqs: Vec<u32>,
     pub org_id: u32,
+    pub doc_len: u32,
     pub gain: f32,
     pub leaf_id: i32,
 }
@@ -29,6 +30,7 @@ pub enum Error {
 pub struct Forward {
     pub docs: Vec<Doc>,
     pub uniq_terms: usize,
+    pub avg_doc_len: f64,
 }
 
 
@@ -56,6 +58,7 @@ pub fn from_ciff<P: AsRef<std::path::Path>>(
             terms: Vec::with_capacity(256), // initial estimate for uniq terms in doc
             freqs: Vec::with_capacity(256),
             org_id: doc_id as u32,
+            doc_len: 0,
             gain: 0.0,
             leaf_id: -1,
         });
@@ -96,6 +99,13 @@ pub fn from_ciff<P: AsRef<std::path::Path>>(
         uniq_terms += 1;
     }
     pb_plist.finish_and_clear();
+
+    // Read doc records to get document lengths
+    let avg_doc_len = ciff_reader.avg_doc_len();
+    while let Some(ciff::CiffRecord::Document { doc_id, length, .. }) = ciff_reader.next() {
+        docs[doc_id as usize].doc_len = length;
+    }
+
     for doc in docs.iter_mut() {
         doc.terms.shrink_to_fit();
         doc.freqs.shrink_to_fit();
@@ -105,8 +115,9 @@ pub fn from_ciff<P: AsRef<std::path::Path>>(
     info!("\tdiscarded frequent terms: {}", frequent_terms);
     info!("\tdiscarded infrequent terms: {}", infrequent_terms);
     info!("\tremaining terms: {}", term_id + 1);
+    info!("\taverage doc length: {:.2}", avg_doc_len);
 
-    let forward_idx = Forward { docs, uniq_terms };
+    let forward_idx = Forward { docs, uniq_terms, avg_doc_len };
 
     if let Some(path) = output_path {
         info!("Saving forward index to file: {:?}", path.as_ref().to_str());

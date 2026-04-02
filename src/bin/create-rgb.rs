@@ -104,7 +104,7 @@ fn validate_gain() {
         std::process::exit(1);
     }
     let gain_func = gain_func.unwrap();
-    let gain_types = vec!["default", "approx_1", "approx_2", "cache_miss", "freq_var"];
+    let gain_types = vec!["default", "approx_1", "approx_2", "cache_miss", "freq_var", "bm25_var"];
     if gain_types.iter().any(|&i| i == gain_func) {
         log::info!("Using the `{}` gain function.", gain_func);
         if gain_func == "cache_miss" {
@@ -150,7 +150,7 @@ fn main() -> Result<()> {
 
     // Check that we're not trying to both read and write a pre-existing forward index
     let start_fwd = std::time::Instant::now();
-    let forward::Forward { mut docs, uniq_terms } = match opt.input_fidx {
+    let forward::Forward { mut docs, uniq_terms, avg_doc_len } = match opt.input_fidx {
     	Some(index) => {info!("(1) reading forward index from file"); forward::from_file(index)?},
     	None => {info!("(1) building forward index"); forward::from_ciff(&opt.input, opt.min_len, opt.cutoff_frequency, opt.output_fidx.as_ref())?},
     };
@@ -181,7 +181,8 @@ fn main() -> Result<()> {
         opt.parallel_switch,
         depth,
         opt.sort_leaf,
-        1
+        1,
+        avg_doc_len,
     );
     let rgb_time = start_rgb.elapsed().as_secs_f32();
     info!("rgb duration: {:.2} secs", rgb_time);

@@ -253,6 +253,18 @@ fn compute_degrees_r(docs: &[Doc], num_terms: usize) -> Vec<i32> {
     compute_degrees(right, num_terms)
 }
 
+// BM25 parameters, set at compile time via BM25_K1 and BM25_B env vars.
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.5;
+
+// BM25 term weight (without IDF — constant per term, so irrelevant for variance)
+#[inline]
+fn bm25_weight(tf: u32, doc_len: u32, avg_doc_len: f64) -> f64 {
+    let f = tf as f64;
+    let dl = doc_len as f64;
+    f * (BM25_K1 + 1.0) / (f + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avg_doc_len))
+}
+
 // Cache-miss threshold, set at compile time via CACHE_MISS_T env var.
 // Represents the number of docid positions that fit in a cache-friendly window.
 const CACHE_MISS_T: usize = {
@@ -550,6 +562,171 @@ fn compute_move_gains_freq_var_r2l_seq(
     });
 }
 
+// Compute sum of BM25 weights per term across a doc slice
+fn compute_bm25_sumw(docs: &[Doc], num_terms: usize, avg_doc_len: f64) -> Vec<f64> {
+    let mut sumw = vec![0.0f64; num_terms];
+    for doc in docs {
+        for i in 0..doc.terms.len() {
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            sumw[doc.terms[i] as usize] += w;
+        }
+    }
+    sumw
+}
+
+// Compute sum of squared BM25 weights per term across a doc slice
+fn compute_bm25_sumw2(docs: &[Doc], num_terms: usize, avg_doc_len: f64) -> Vec<f64> {
+    let mut sumw2 = vec![0.0f64; num_terms];
+    for doc in docs {
+        for i in 0..doc.terms.len() {
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            sumw2[doc.terms[i] as usize] += w * w;
+        }
+    }
+    sumw2
+}
+
+// BM25-variance move gain for one term.
+// Same structure as freq_var_term_gain but with BM25 weights (f64).
+#[inline]
+fn bm25_var_term_gain(
+    w: f64,
+    n_from: i32,
+    n_to: i32,
+    sumw_from: f64,
+    sumw_to: f64,
+    sumw2_from: f64,
+    sumw2_to: f64,
+) -> f64 {
+    let nf = n_from as f64;
+    let nt = n_to as f64;
+    w * w * (nf - nt) + (sumw2_from - sumw2_to) + 2.0 * w * (sumw_to - sumw_from)
+}
+
+// BM25-variance gain, L->R, PARALLEL
+fn compute_move_gains_bm25_var_l2r(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumw: &[f64],
+    tsumw: &[f64],
+    fsumw2: &[f64],
+    tsumw2: &[f64],
+    avg_doc_len: f64,
+) {
+    from.par_iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f64;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            doc_gain += bm25_var_term_gain(
+                w,
+                fdeg[term],
+                tdeg[term],
+                fsumw[term],
+                tsumw[term],
+                fsumw2[term],
+                tsumw2[term],
+            );
+        }
+        doc.gain = doc_gain as f32;
+        doc.leaf_id = 0;
+    });
+}
+
+// BM25-variance gain, R->L, PARALLEL
+fn compute_move_gains_bm25_var_r2l(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumw: &[f64],
+    tsumw: &[f64],
+    fsumw2: &[f64],
+    tsumw2: &[f64],
+    avg_doc_len: f64,
+) {
+    from.par_iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f64;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            doc_gain -= bm25_var_term_gain(
+                w,
+                fdeg[term],
+                tdeg[term],
+                fsumw[term],
+                tsumw[term],
+                fsumw2[term],
+                tsumw2[term],
+            );
+        }
+        doc.gain = doc_gain as f32;
+        doc.leaf_id = 0;
+    });
+}
+
+// BM25-variance gain, L->R, SEQUENTIAL
+fn compute_move_gains_bm25_var_l2r_seq(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumw: &[f64],
+    tsumw: &[f64],
+    fsumw2: &[f64],
+    tsumw2: &[f64],
+    avg_doc_len: f64,
+) {
+    from.iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f64;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            doc_gain += bm25_var_term_gain(
+                w,
+                fdeg[term],
+                tdeg[term],
+                fsumw[term],
+                tsumw[term],
+                fsumw2[term],
+                tsumw2[term],
+            );
+        }
+        doc.gain = doc_gain as f32;
+        doc.leaf_id = 0;
+    });
+}
+
+// BM25-variance gain, R->L, SEQUENTIAL
+fn compute_move_gains_bm25_var_r2l_seq(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumw: &[f64],
+    tsumw: &[f64],
+    fsumw2: &[f64],
+    tsumw2: &[f64],
+    avg_doc_len: f64,
+) {
+    from.iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f64;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            doc_gain -= bm25_var_term_gain(
+                w,
+                fdeg[term],
+                tdeg[term],
+                fsumw[term],
+                tsumw[term],
+                fsumw2[term],
+                tsumw2[term],
+            );
+        }
+        doc.gain = doc_gain as f32;
+        doc.leaf_id = 0;
+    });
+}
+
 // This is the original cost function: Asymmetric
 fn expb(log_from: f32, log_to: f32, deg1: i32, deg2: i32) -> f32 {
     let d1f = deg1 as f32;
@@ -800,8 +977,14 @@ fn compute_move_gains_a2_seq(
 // This function is a wrapper to the correct gain function, which is specified at compile-time
 // using the `GAIN` environment variable
 // PARALLEL VERSION
-fn compute_gains(mut left: &mut [Doc], mut right: &mut [Doc], ldeg: &[i32], rdeg: &[i32]) {
-    let gain_func: &str = std::option_env!("GAIN").unwrap_or("freq_var");
+fn compute_gains(
+    mut left: &mut [Doc],
+    mut right: &mut [Doc],
+    ldeg: &[i32],
+    rdeg: &[i32],
+    avg_doc_len: f64,
+) {
+    let gain_func: &str = std::option_env!("GAIN").unwrap_or("cache_miss");
 
     let log2_left = 0.0;
     let log2_right = 0.0;
@@ -893,6 +1076,41 @@ fn compute_gains(mut left: &mut [Doc], mut right: &mut [Doc], ldeg: &[i32], rdeg
             });
         }
 
+        // (5) -- BM25-variance cost function
+        "bm25_var" => {
+            let num_terms = ldeg.len();
+            let left_sumw = compute_bm25_sumw(&left, num_terms, avg_doc_len);
+            let right_sumw = compute_bm25_sumw(&right, num_terms, avg_doc_len);
+            let left_sumw2 = compute_bm25_sumw2(&left, num_terms, avg_doc_len);
+            let right_sumw2 = compute_bm25_sumw2(&right, num_terms, avg_doc_len);
+            rayon::scope(|s| {
+                s.spawn(|_| {
+                    compute_move_gains_bm25_var_l2r(
+                        &mut left,
+                        &ldeg,
+                        &rdeg,
+                        &left_sumw,
+                        &right_sumw,
+                        &left_sumw2,
+                        &right_sumw2,
+                        avg_doc_len,
+                    );
+                });
+                s.spawn(|_| {
+                    compute_move_gains_bm25_var_r2l(
+                        &mut right,
+                        &rdeg,
+                        &ldeg,
+                        &right_sumw,
+                        &left_sumw,
+                        &right_sumw2,
+                        &left_sumw2,
+                        avg_doc_len,
+                    );
+                });
+            });
+        }
+
         // Should be unreachable...
         _ => {
             log::info!("Error: Couldn't match the gain function.");
@@ -901,10 +1119,16 @@ fn compute_gains(mut left: &mut [Doc], mut right: &mut [Doc], ldeg: &[i32], rdeg
 }
 
 // This function is a wrapper to the correct gain function, which is specified at compile-time
-// using the `GAIN` environment variable (defaults to approx_1)
+// using the `GAIN` environment variable
 // SEQUENTIAL VERSION
-fn compute_gains_seq(mut left: &mut [Doc], mut right: &mut [Doc], ldeg: &[i32], rdeg: &[i32]) {
-    let gain_func: &str = std::option_env!("GAIN").unwrap_or("freq_var");
+fn compute_gains_seq(
+    mut left: &mut [Doc],
+    mut right: &mut [Doc],
+    ldeg: &[i32],
+    rdeg: &[i32],
+    avg_doc_len: f64,
+) {
+    let gain_func: &str = std::option_env!("GAIN").unwrap_or("cache_miss");
 
     let log2_left = 0.0;
     let log2_right = 0.0;
@@ -966,6 +1190,35 @@ fn compute_gains_seq(mut left: &mut [Doc], mut right: &mut [Doc], ldeg: &[i32], 
             );
         }
 
+        // (5) -- BM25-variance cost function
+        "bm25_var" => {
+            let num_terms = ldeg.len();
+            let left_sumw = compute_bm25_sumw(&left, num_terms, avg_doc_len);
+            let right_sumw = compute_bm25_sumw(&right, num_terms, avg_doc_len);
+            let left_sumw2 = compute_bm25_sumw2(&left, num_terms, avg_doc_len);
+            let right_sumw2 = compute_bm25_sumw2(&right, num_terms, avg_doc_len);
+            compute_move_gains_bm25_var_l2r_seq(
+                &mut left,
+                &ldeg,
+                &rdeg,
+                &left_sumw,
+                &right_sumw,
+                &left_sumw2,
+                &right_sumw2,
+                avg_doc_len,
+            );
+            compute_move_gains_bm25_var_r2l_seq(
+                &mut right,
+                &rdeg,
+                &ldeg,
+                &right_sumw,
+                &left_sumw,
+                &right_sumw2,
+                &left_sumw2,
+                avg_doc_len,
+            );
+        }
+
         // Should be unreachable...
         _ => {
             log::info!("Error: Couldn't match the gain function.");
@@ -975,7 +1228,7 @@ fn compute_gains_seq(mut left: &mut [Doc], mut right: &mut [Doc], ldeg: &[i32], 
 
 // The heavy lifting -- core logic for the BP process
 // PARALLEL VERSION
-fn process_partitions(mut docs: &mut [Doc], num_terms: usize, iterations: usize) {
+fn process_partitions(mut docs: &mut [Doc], num_terms: usize, iterations: usize, avg_doc_len: f64) {
     // compute degrees in left and right partition for each term
     let (mut left_deg, mut right_deg) = rayon::join(
         || compute_degrees_l(&docs, num_terms),
@@ -987,7 +1240,13 @@ fn process_partitions(mut docs: &mut [Doc], num_terms: usize, iterations: usize)
         if QUICKSELECT {
             // Split in half and compute gains
             let (mut left, mut right) = docs.split_at_mut(docs.len() / 2);
-            compute_gains(&mut left, &mut right, &left_deg[..], &right_deg[..]);
+            compute_gains(
+                &mut left,
+                &mut right,
+                &left_deg[..],
+                &right_deg[..],
+                avg_doc_len,
+            );
 
             // Use quickselect to partition the global doc slice into < median and > median
             let median_idx = docs.len() / 2;
@@ -1010,7 +1269,13 @@ fn process_partitions(mut docs: &mut [Doc], num_terms: usize, iterations: usize)
         else {
             // Split in half and compute gains
             let (mut left, mut right) = docs.split_at_mut(docs.len() / 2);
-            compute_gains(&mut left, &mut right, &left_deg[..], &right_deg[..]);
+            compute_gains(
+                &mut left,
+                &mut right,
+                &left_deg[..],
+                &right_deg[..],
+                avg_doc_len,
+            );
 
             // Use parallel sorts on each half to re-arrange documents by their gains
             if PSORT {
@@ -1050,7 +1315,12 @@ fn process_partitions(mut docs: &mut [Doc], num_terms: usize, iterations: usize)
 
 // The heavy lifting -- core logic for the BP process.
 // SEQUENTIAL VERSION
-fn process_partitions_seq(mut docs: &mut [Doc], num_terms: usize, iterations: usize) {
+fn process_partitions_seq(
+    mut docs: &mut [Doc],
+    num_terms: usize,
+    iterations: usize,
+    avg_doc_len: f64,
+) {
     // compute degrees in left and right partition for each term
     let mut left_deg = compute_degrees_l(&docs, num_terms);
     let mut right_deg = compute_degrees_r(&docs, num_terms);
@@ -1060,7 +1330,13 @@ fn process_partitions_seq(mut docs: &mut [Doc], num_terms: usize, iterations: us
         if QUICKSELECT {
             // Split in half and compute gains
             let (mut left, mut right) = docs.split_at_mut(docs.len() / 2);
-            compute_gains_seq(&mut left, &mut right, &left_deg[..], &right_deg[..]);
+            compute_gains_seq(
+                &mut left,
+                &mut right,
+                &left_deg[..],
+                &right_deg[..],
+                avg_doc_len,
+            );
 
             // Use quickselect to partition the global doc slice into < median and > median
             let median_idx = docs.len() / 2;
@@ -1082,7 +1358,13 @@ fn process_partitions_seq(mut docs: &mut [Doc], num_terms: usize, iterations: us
         else {
             // Split in half and compute gains
             let (mut left, mut right) = docs.split_at_mut(docs.len() / 2);
-            compute_gains_seq(&mut left, &mut right, &left_deg[..], &right_deg[..]);
+            compute_gains_seq(
+                &mut left,
+                &mut right,
+                &left_deg[..],
+                &right_deg[..],
+                avg_doc_len,
+            );
 
             // Use parallel sorts on each half to re-arrange documents by their gains
             if PSORT {
@@ -1132,6 +1414,7 @@ pub fn recursive_graph_bisection(
     depth: usize,
     sort_leaf: bool,
     id: usize,
+    avg_doc_len: f64,
 ) {
     // recursion end?
     if docs.len() <= min_partition_size || depth > max_depth {
@@ -1149,9 +1432,9 @@ pub fn recursive_graph_bisection(
     // This should theoretically help avoid queuing/contention/preemption issues
     if depth > parallel_switch {
         // No parallel
-        process_partitions_seq(docs, num_terms, iterations);
+        process_partitions_seq(docs, num_terms, iterations, avg_doc_len);
     } else {
-        process_partitions(docs, num_terms, iterations);
+        process_partitions(docs, num_terms, iterations, avg_doc_len);
     }
 
     let (mut left, mut right) = docs.split_at_mut(docs.len() / 2);
@@ -1169,6 +1452,7 @@ pub fn recursive_graph_bisection(
                 depth + 1,
                 sort_leaf,
                 2 * id,
+                avg_doc_len,
             );
         });
         s.spawn(|_| {
@@ -1182,6 +1466,7 @@ pub fn recursive_graph_bisection(
                 depth + 1,
                 sort_leaf,
                 2 * id + 1,
+                avg_doc_len,
             );
         });
     });
@@ -1203,6 +1488,7 @@ pub fn recursive_graph_bisection_iterative(
     _depth: usize,
     sort_leaf: bool,
     _id: usize,
+    avg_doc_len: f64,
 ) {
     // The initial slice is the whole collection
     let mut all_slices = Vec::new();
@@ -1231,13 +1517,13 @@ pub fn recursive_graph_bisection_iterative(
         //
         // Selective parallelization
         if current_depth > parallel_switch {
-            all_slices
-                .par_iter_mut()
-                .for_each(|slice| process_partitions_seq(slice, num_terms, iterations));
+            all_slices.par_iter_mut().for_each(|slice| {
+                process_partitions_seq(slice, num_terms, iterations, avg_doc_len)
+            });
         } else {
             all_slices
                 .par_iter_mut()
-                .for_each(|slice| process_partitions(slice, num_terms, iterations));
+                .for_each(|slice| process_partitions(slice, num_terms, iterations, avg_doc_len));
         }
 
         // (2) Compute the new slices

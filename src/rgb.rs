@@ -984,7 +984,7 @@ fn compute_gains(
     rdeg: &[i32],
     avg_doc_len: f64,
 ) {
-    let gain_func: &str = std::option_env!("GAIN").unwrap_or("cache_miss");
+    let gain_func: &str = std::option_env!("GAIN").unwrap_or("bm25_var");
 
     let log2_left = 0.0;
     let log2_right = 0.0;
@@ -1128,7 +1128,7 @@ fn compute_gains_seq(
     rdeg: &[i32],
     avg_doc_len: f64,
 ) {
-    let gain_func: &str = std::option_env!("GAIN").unwrap_or("cache_miss");
+    let gain_func: &str = std::option_env!("GAIN").unwrap_or("bm25_var");
 
     let log2_left = 0.0;
     let log2_right = 0.0;

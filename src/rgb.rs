@@ -381,6 +381,212 @@ fn compute_move_gains_cache_miss_r2l_seq(
     });
 }
 
+// --- Frequency-variance cost function ---
+// Minimizes pairwise frequency divergence within partitions.
+// For term t in partition P: V_t = 2*n_t*Q_t - 2*S_t^2
+// where n_t = doc count, S_t = sum of freqs, Q_t = sum of squared freqs.
+
+// Compute sum-of-frequencies per term across a doc slice
+fn compute_sumf(docs: &[Doc], num_terms: usize) -> Vec<i64> {
+    let mut sumf = vec![0i64; num_terms];
+    for doc in docs {
+        for (term, freq) in doc.terms.iter().zip(doc.freqs.iter()) {
+            sumf[*term as usize] += *freq as i64;
+        }
+    }
+    sumf
+}
+
+// Compute sum-of-squared-frequencies per term across a doc slice
+fn compute_sumf2(docs: &[Doc], num_terms: usize) -> Vec<i64> {
+    let mut sumf2 = vec![0i64; num_terms];
+    for doc in docs {
+        for (term, freq) in doc.terms.iter().zip(doc.freqs.iter()) {
+            let f = *freq as i64;
+            sumf2[*term as usize] += f * f;
+        }
+    }
+    sumf2
+}
+
+// Convenience: compute sumf for left half
+fn compute_sumf_l(docs: &[Doc], num_terms: usize) -> Vec<i64> {
+    let (left, _) = docs.split_at(docs.len() / 2);
+    compute_sumf(left, num_terms)
+}
+fn compute_sumf_r(docs: &[Doc], num_terms: usize) -> Vec<i64> {
+    let (_, right) = docs.split_at(docs.len() / 2);
+    compute_sumf(right, num_terms)
+}
+fn compute_sumf2_l(docs: &[Doc], num_terms: usize) -> Vec<i64> {
+    let (left, _) = docs.split_at(docs.len() / 2);
+    compute_sumf2(left, num_terms)
+}
+fn compute_sumf2_r(docs: &[Doc], num_terms: usize) -> Vec<i64> {
+    let (_, right) = docs.split_at(docs.len() / 2);
+    compute_sumf2(right, num_terms)
+}
+
+// Update sumf/sumf2 arrays after quickselect swaps (analogous to fix_degrees)
+fn fix_freq_stats(
+    docs: &[Doc],
+    left_sumf: &mut [i64],
+    right_sumf: &mut [i64],
+    left_sumf2: &mut [i64],
+    right_sumf2: &mut [i64],
+) {
+    for doc in docs.iter() {
+        if doc.leaf_id == -1 {
+            // Doc went right to left
+            for (term, freq) in doc.terms.iter().zip(doc.freqs.iter()) {
+                let f = *freq as i64;
+                left_sumf[*term as usize] += f;
+                right_sumf[*term as usize] -= f;
+                left_sumf2[*term as usize] += f * f;
+                right_sumf2[*term as usize] -= f * f;
+            }
+        } else if doc.leaf_id == 1 {
+            // Doc went left to right
+            for (term, freq) in doc.terms.iter().zip(doc.freqs.iter()) {
+                let f = *freq as i64;
+                left_sumf[*term as usize] -= f;
+                right_sumf[*term as usize] += f;
+                left_sumf2[*term as usize] -= f * f;
+                right_sumf2[*term as usize] += f * f;
+            }
+        }
+    }
+}
+
+// Frequency-variance move gain for one term.
+// gain_t = 2*f^2*(n_L - n_R) + 2*(Q_L - Q_R) + 4*f*(S_R - S_L)
+// where f = freq of this term in the moving document.
+// Positive gain = variance reduction = good move.
+#[inline]
+fn freq_var_term_gain(
+    f: i64,
+    n_from: i32,
+    n_to: i32,
+    sumf_from: i64,
+    sumf_to: i64,
+    sumf2_from: i64,
+    sumf2_to: i64,
+) -> f32 {
+    let gain = 2 * f * f * (n_from as i64 - n_to as i64)
+        + 2 * (sumf2_from - sumf2_to)
+        + 4 * f * (sumf_to - sumf_from);
+    gain as f32
+}
+
+// Compute move gains using frequency-variance cost function
+// L->R direction, PARALLEL VERSION
+fn compute_move_gains_freq_var_l2r(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumf: &[i64],
+    tsumf: &[i64],
+    fsumf2: &[i64],
+    tsumf2: &[i64],
+) {
+    from.par_iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f32;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let f = doc.freqs[i] as i64;
+            doc_gain += freq_var_term_gain(
+                f,
+                fdeg[term], tdeg[term],
+                fsumf[term], tsumf[term],
+                fsumf2[term], tsumf2[term],
+            );
+        }
+        doc.gain = doc_gain;
+        doc.leaf_id = 0;
+    });
+}
+
+// R->L direction, PARALLEL VERSION
+fn compute_move_gains_freq_var_r2l(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumf: &[i64],
+    tsumf: &[i64],
+    fsumf2: &[i64],
+    tsumf2: &[i64],
+) {
+    from.par_iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f32;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let f = doc.freqs[i] as i64;
+            doc_gain -= freq_var_term_gain(
+                f,
+                fdeg[term], tdeg[term],
+                fsumf[term], tsumf[term],
+                fsumf2[term], tsumf2[term],
+            );
+        }
+        doc.gain = doc_gain;
+        doc.leaf_id = 0;
+    });
+}
+
+// L->R direction, SEQUENTIAL VERSION
+fn compute_move_gains_freq_var_l2r_seq(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumf: &[i64],
+    tsumf: &[i64],
+    fsumf2: &[i64],
+    tsumf2: &[i64],
+) {
+    from.iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f32;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let f = doc.freqs[i] as i64;
+            doc_gain += freq_var_term_gain(
+                f,
+                fdeg[term], tdeg[term],
+                fsumf[term], tsumf[term],
+                fsumf2[term], tsumf2[term],
+            );
+        }
+        doc.gain = doc_gain;
+        doc.leaf_id = 0;
+    });
+}
+
+// R->L direction, SEQUENTIAL VERSION
+fn compute_move_gains_freq_var_r2l_seq(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumf: &[i64],
+    tsumf: &[i64],
+    fsumf2: &[i64],
+    tsumf2: &[i64],
+) {
+    from.iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f32;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let f = doc.freqs[i] as i64;
+            doc_gain -= freq_var_term_gain(
+                f,
+                fdeg[term], tdeg[term],
+                fsumf[term], tsumf[term],
+                fsumf2[term], tsumf2[term],
+            );
+        }
+        doc.gain = doc_gain;
+        doc.leaf_id = 0;
+    });
+}
+
 // This is the original cost function: Asymmetric
 fn expb(log_from: f32, log_to: f32, deg1: i32, deg2: i32) -> f32 {
     let d1f = deg1 as f32;
@@ -892,6 +1098,152 @@ fn process_partitions_seq(mut docs: &mut [Doc], num_terms: usize, iterations: us
     }
 }
 
+// The heavy lifting -- core logic for the BP process using frequency-variance cost function.
+// PARALLEL VERSION
+fn process_partitions_freq_var(mut docs: &mut [Doc], num_terms: usize, iterations: usize) {
+    let (mut left_deg, mut right_deg) = rayon::join(
+        || compute_degrees_l(&docs, num_terms),
+        || compute_degrees_r(&docs, num_terms),
+    );
+    let mut left_sumf = compute_sumf_l(&docs, num_terms);
+    let mut right_sumf = compute_sumf_r(&docs, num_terms);
+    let mut left_sumf2 = compute_sumf2_l(&docs, num_terms);
+    let mut right_sumf2 = compute_sumf2_r(&docs, num_terms);
+
+    for _iter in 0..iterations {
+        if QUICKSELECT {
+            let (mut left, mut right) = docs.split_at_mut(docs.len() / 2);
+            rayon::scope(|s| {
+                s.spawn(|_| {
+                    compute_move_gains_freq_var_l2r(
+                        &mut left, &left_deg, &right_deg,
+                        &left_sumf, &right_sumf, &left_sumf2, &right_sumf2,
+                    );
+                });
+                s.spawn(|_| {
+                    compute_move_gains_freq_var_r2l(
+                        &mut right, &right_deg, &left_deg,
+                        &right_sumf, &left_sumf, &right_sumf2, &left_sumf2,
+                    );
+                });
+            });
+
+            let median_idx = docs.len() / 2;
+            if COOLING {
+                partition_quickselect(&mut docs, median_idx, (_iter as f32) * 0.5);
+            } else {
+                partition_quickselect(&mut docs, median_idx, 0.0);
+            }
+
+            let nswaps = fix_degrees(docs, &mut left_deg[..], &mut right_deg[..]);
+            fix_freq_stats(docs, &mut left_sumf, &mut right_sumf, &mut left_sumf2, &mut right_sumf2);
+            if nswaps == 0 {
+                break;
+            }
+        } else {
+            let (mut left, mut right) = docs.split_at_mut(docs.len() / 2);
+            rayon::scope(|s| {
+                s.spawn(|_| {
+                    compute_move_gains_freq_var_l2r(
+                        &mut left, &left_deg, &right_deg,
+                        &left_sumf, &right_sumf, &left_sumf2, &right_sumf2,
+                    );
+                });
+                s.spawn(|_| {
+                    compute_move_gains_freq_var_r2l(
+                        &mut right, &right_deg, &left_deg,
+                        &right_sumf, &left_sumf, &right_sumf2, &left_sumf2,
+                    );
+                });
+            });
+
+            if PSORT {
+                left.par_sort_by(|a, b| b.gain.partial_cmp(&a.gain).unwrap_or(Equal));
+                right.par_sort_by(|a, b| a.gain.partial_cmp(&b.gain).unwrap_or(Equal));
+            } else {
+                left.sort_by(|a, b| b.gain.partial_cmp(&a.gain).unwrap_or(Equal));
+                right.sort_by(|a, b| a.gain.partial_cmp(&b.gain).unwrap_or(Equal));
+            }
+
+            let nswaps = if COOLING {
+                swap_documents(&mut left, &mut right, &mut left_deg[..], &mut right_deg[..], _iter as f32)
+            } else {
+                swap_documents(&mut left, &mut right, &mut left_deg[..], &mut right_deg[..], 0.0)
+            };
+            // Also fix freq stats after swap_documents (which uses fix_degrees internally via leaf_id markers)
+            fix_freq_stats(docs, &mut left_sumf, &mut right_sumf, &mut left_sumf2, &mut right_sumf2);
+            if nswaps == 0 {
+                break;
+            }
+        }
+    }
+}
+
+// SEQUENTIAL VERSION
+fn process_partitions_freq_var_seq(mut docs: &mut [Doc], num_terms: usize, iterations: usize) {
+    let mut left_deg = compute_degrees_l(&docs, num_terms);
+    let mut right_deg = compute_degrees_r(&docs, num_terms);
+    let mut left_sumf = compute_sumf_l(&docs, num_terms);
+    let mut right_sumf = compute_sumf_r(&docs, num_terms);
+    let mut left_sumf2 = compute_sumf2_l(&docs, num_terms);
+    let mut right_sumf2 = compute_sumf2_r(&docs, num_terms);
+
+    for _iter in 0..iterations {
+        if QUICKSELECT {
+            let (mut left, mut right) = docs.split_at_mut(docs.len() / 2);
+            compute_move_gains_freq_var_l2r_seq(
+                &mut left, &left_deg, &right_deg,
+                &left_sumf, &right_sumf, &left_sumf2, &right_sumf2,
+            );
+            compute_move_gains_freq_var_r2l_seq(
+                &mut right, &right_deg, &left_deg,
+                &right_sumf, &left_sumf, &right_sumf2, &left_sumf2,
+            );
+
+            let median_idx = docs.len() / 2;
+            if COOLING {
+                partition_quickselect(&mut docs, median_idx, (_iter as f32) * 0.5);
+            } else {
+                partition_quickselect(&mut docs, median_idx, 0.0);
+            }
+
+            let nswaps = fix_degrees(docs, &mut left_deg[..], &mut right_deg[..]);
+            fix_freq_stats(docs, &mut left_sumf, &mut right_sumf, &mut left_sumf2, &mut right_sumf2);
+            if nswaps == 0 {
+                break;
+            }
+        } else {
+            let (mut left, mut right) = docs.split_at_mut(docs.len() / 2);
+            compute_move_gains_freq_var_l2r_seq(
+                &mut left, &left_deg, &right_deg,
+                &left_sumf, &right_sumf, &left_sumf2, &right_sumf2,
+            );
+            compute_move_gains_freq_var_r2l_seq(
+                &mut right, &right_deg, &left_deg,
+                &right_sumf, &left_sumf, &right_sumf2, &left_sumf2,
+            );
+
+            if PSORT {
+                left.par_sort_by(|a, b| b.gain.partial_cmp(&a.gain).unwrap_or(Equal));
+                right.par_sort_by(|a, b| a.gain.partial_cmp(&b.gain).unwrap_or(Equal));
+            } else {
+                left.sort_by(|a, b| b.gain.partial_cmp(&a.gain).unwrap_or(Equal));
+                right.sort_by(|a, b| a.gain.partial_cmp(&b.gain).unwrap_or(Equal));
+            }
+
+            let nswaps = if COOLING {
+                swap_documents(&mut left, &mut right, &mut left_deg[..], &mut right_deg[..], _iter as f32)
+            } else {
+                swap_documents(&mut left, &mut right, &mut left_deg[..], &mut right_deg[..], 0.0)
+            };
+            fix_freq_stats(docs, &mut left_sumf, &mut right_sumf, &mut left_sumf2, &mut right_sumf2);
+            if nswaps == 0 {
+                break;
+            }
+        }
+    }
+}
+
 // The `default` and purely recursive graph bisection implementation.
 pub fn recursive_graph_bisection(
     docs: &mut [Doc],
@@ -993,6 +1345,8 @@ pub fn recursive_graph_bisection_iterative(
     }
 
     let mut current_depth = START_DEPTH;
+    let gain_func: &str = std::option_env!("GAIN").unwrap_or("cache_miss");
+    let use_freq_var = gain_func == "freq_var";
 
     // We loop until we run out of slices to process
     while !all_slices.is_empty() {
@@ -1001,7 +1355,17 @@ pub fn recursive_graph_bisection_iterative(
         // (1) Process the slices
         //
         // Selective parallelization
-        if current_depth > parallel_switch {
+        if use_freq_var {
+            if current_depth > parallel_switch {
+                all_slices
+                    .par_iter_mut()
+                    .for_each(|slice| process_partitions_freq_var_seq(slice, num_terms, iterations));
+            } else {
+                all_slices
+                    .par_iter_mut()
+                    .for_each(|slice| process_partitions_freq_var(slice, num_terms, iterations));
+            }
+        } else if current_depth > parallel_switch {
             all_slices
                 .par_iter_mut()
                 .for_each(|slice| process_partitions_seq(slice, num_terms, iterations));

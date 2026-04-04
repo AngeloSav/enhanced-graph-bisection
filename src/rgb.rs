@@ -603,6 +603,26 @@ fn bm25_var_term_gain(
     w * w * (nf - nt) + (sumw2_from - sumw2_to) + 2.0 * w * (sumw_to - sumw_from)
 }
 
+// Score-Smoothness move gain for one term (DEC-003).
+// gain_t = (w - mean_from)^2 - (w - mean_to)^2
+// where mean_from = sumw_from / f_from, mean_to = sumw_to / f_to.
+// Positive gain = variance reduction = good move.
+#[inline]
+fn score_smooth_term_gain(
+    w: f64,
+    f_from: i32,
+    f_to: i32,
+    sumw_from: f64,
+    sumw_to: f64,
+) -> f64 {
+    if f_from <= 0 { return 0.0; }
+    let mean_from = sumw_from / f_from as f64;
+    let mean_to = if f_to > 0 { sumw_to / f_to as f64 } else { w };
+    let d_from = w - mean_from;
+    let d_to = w - mean_to;
+    d_from * d_from - d_to * d_to
+}
+
 // BM25-variance gain, L->R, PARALLEL
 fn compute_move_gains_bm25_var_l2r(
     from: &mut [Doc],
@@ -721,6 +741,90 @@ fn compute_move_gains_bm25_var_r2l_seq(
                 fsumw2[term],
                 tsumw2[term],
             );
+        }
+        doc.gain = doc_gain as f32;
+        doc.leaf_id = 0;
+    });
+}
+
+// Score-Smoothness gain, L->R, PARALLEL
+fn compute_move_gains_score_smooth_l2r(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumw: &[f64],
+    tsumw: &[f64],
+    avg_doc_len: f64,
+) {
+    from.par_iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f64;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            doc_gain += score_smooth_term_gain(w, fdeg[term], tdeg[term], fsumw[term], tsumw[term]);
+        }
+        doc.gain = doc_gain as f32;
+        doc.leaf_id = 0;
+    });
+}
+
+// Score-Smoothness gain, R->L, PARALLEL
+fn compute_move_gains_score_smooth_r2l(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumw: &[f64],
+    tsumw: &[f64],
+    avg_doc_len: f64,
+) {
+    from.par_iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f64;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            doc_gain -= score_smooth_term_gain(w, fdeg[term], tdeg[term], fsumw[term], tsumw[term]);
+        }
+        doc.gain = doc_gain as f32;
+        doc.leaf_id = 0;
+    });
+}
+
+// Score-Smoothness gain, L->R, SEQUENTIAL
+fn compute_move_gains_score_smooth_l2r_seq(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumw: &[f64],
+    tsumw: &[f64],
+    avg_doc_len: f64,
+) {
+    from.iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f64;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            doc_gain += score_smooth_term_gain(w, fdeg[term], tdeg[term], fsumw[term], tsumw[term]);
+        }
+        doc.gain = doc_gain as f32;
+        doc.leaf_id = 0;
+    });
+}
+
+// Score-Smoothness gain, R->L, SEQUENTIAL
+fn compute_move_gains_score_smooth_r2l_seq(
+    from: &mut [Doc],
+    fdeg: &[i32],
+    tdeg: &[i32],
+    fsumw: &[f64],
+    tsumw: &[f64],
+    avg_doc_len: f64,
+) {
+    from.iter_mut().for_each(|doc| {
+        let mut doc_gain = 0.0f64;
+        for i in 0..doc.terms.len() {
+            let term = doc.terms[i] as usize;
+            let w = bm25_weight(doc.freqs[i], doc.doc_len, avg_doc_len);
+            doc_gain -= score_smooth_term_gain(w, fdeg[term], tdeg[term], fsumw[term], tsumw[term]);
         }
         doc.gain = doc_gain as f32;
         doc.leaf_id = 0;
@@ -1111,6 +1215,35 @@ fn compute_gains(
             });
         }
 
+        // (6) -- Score-Smoothness cost function (DEC-003)
+        "score_smooth" => {
+            let num_terms = ldeg.len();
+            let left_sumw = compute_bm25_sumw(&left, num_terms, avg_doc_len);
+            let right_sumw = compute_bm25_sumw(&right, num_terms, avg_doc_len);
+            rayon::scope(|s| {
+                s.spawn(|_| {
+                    compute_move_gains_score_smooth_l2r(
+                        &mut left,
+                        &ldeg,
+                        &rdeg,
+                        &left_sumw,
+                        &right_sumw,
+                        avg_doc_len,
+                    );
+                });
+                s.spawn(|_| {
+                    compute_move_gains_score_smooth_r2l(
+                        &mut right,
+                        &rdeg,
+                        &ldeg,
+                        &right_sumw,
+                        &left_sumw,
+                        avg_doc_len,
+                    );
+                });
+            });
+        }
+
         // Should be unreachable...
         _ => {
             log::info!("Error: Couldn't match the gain function.");
@@ -1215,6 +1348,29 @@ fn compute_gains_seq(
                 &left_sumw,
                 &right_sumw2,
                 &left_sumw2,
+                avg_doc_len,
+            );
+        }
+
+        // (6) -- Score-Smoothness cost function (DEC-003)
+        "score_smooth" => {
+            let num_terms = ldeg.len();
+            let left_sumw = compute_bm25_sumw(&left, num_terms, avg_doc_len);
+            let right_sumw = compute_bm25_sumw(&right, num_terms, avg_doc_len);
+            compute_move_gains_score_smooth_l2r_seq(
+                &mut left,
+                &ldeg,
+                &rdeg,
+                &left_sumw,
+                &right_sumw,
+                avg_doc_len,
+            );
+            compute_move_gains_score_smooth_r2l_seq(
+                &mut right,
+                &rdeg,
+                &ldeg,
+                &right_sumw,
+                &left_sumw,
                 avg_doc_len,
             );
         }

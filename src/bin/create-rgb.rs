@@ -104,7 +104,7 @@ fn validate_gain() {
         std::process::exit(1);
     }
     let gain_func = gain_func.unwrap();
-    let gain_types = vec!["default", "approx_1", "approx_2", "cache_miss", "freq_var", "bm25_var"];
+    let gain_types = vec!["default", "approx_1", "approx_2", "cache_miss", "freq_var", "bm25_var", "score_smooth"];
     if gain_types.iter().any(|&i| i == gain_func) {
         log::info!("Using the `{}` gain function.", gain_func);
         if gain_func == "cache_miss" {
